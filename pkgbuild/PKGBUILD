@@ -1,9 +1,16 @@
 # Maintainer: Tales A. Mendonça <talesam@gmail.com>
 
-pkgname=pkgbuild-template
-pkgdesc="Package template for Communitybig"
+pkgname=comm-kernel-manager
+pkgdesc="Application to manage kernel and mesa"
 # Uncomment and edit the following lines as needed
-#depends=('')
+depends=(
+  'python>=3.6'
+  'python-gobject'
+  'python-requests'
+  'gtk4'
+  'libadwaita'
+  'polkit'
+)
 #makedepends=('')
 #optdepends=('')
 #conflicts=('')

@@ -1,0 +1,16 @@
+.terminal {
+    background-color: #222;
+    color: #ddd;
+    padding: 6px;
+    border-radius: 4px;
+}
+
+.success-message {
+    color: #2ecc71;
+    font-weight: bold;
+}
+
+.error-message {
+    color: #e74c3c;
+    font-weight: bold;
+}
