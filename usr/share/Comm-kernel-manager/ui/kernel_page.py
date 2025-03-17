@@ -8,12 +8,48 @@ This module defines the UI for kernel management, allowing users
 to install and manage different kernel versions.
 """
 
+import threading
 import gi
-gi.require_version('Gtk', '4.0')
-gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw, GLib
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, GLib, Gio, GObject
 
 from core.kernel_manager import KernelManager
+from ui.dialogs.progress_dialog import ProgressDialog
+
+
+class KernelModel(GObject.Object):
+    """Model for kernel data in column view."""
+
+    # Define GObject properties
+    id = GObject.Property(type=str, default="")
+    name = GObject.Property(type=str, default="Unknown")
+    version = GObject.Property(type=str, default="Unknown")
+    is_lts = GObject.Property(type=bool, default=False)
+    is_rt = GObject.Property(type=bool, default=False)
+    installed = GObject.Property(type=bool, default=False)
+    running = GObject.Property(type=bool, default=False)
+
+    def __init__(self, kernel_dict):
+        super().__init__()
+        self.original_data = kernel_dict
+
+        # Set properties from dictionary data
+        self.set_property("id", kernel_dict.get("id", ""))
+        self.set_property("name", kernel_dict.get("name", "Unknown"))
+        self.set_property("version", kernel_dict.get("version", "Unknown"))
+        self.set_property(
+            "is_lts",
+            "-lts" in kernel_dict.get("name", "").lower()
+            or kernel_dict.get("lts", False),
+        )
+        self.set_property(
+            "is_rt",
+            "rt" in kernel_dict.get("name", "").lower() or kernel_dict.get("rt", False),
+        )
+        self.set_property("installed", kernel_dict.get("installed", False))
+        self.set_property("running", kernel_dict.get("running", False))
 
 
 class KernelPage(Gtk.Box):
@@ -21,672 +57,579 @@ class KernelPage(Gtk.Box):
 
     def __init__(self):
         """Initialize the kernel management page."""
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.set_margin_top(24)
-        self.set_margin_bottom(24)
-        self.set_margin_start(24)
-        self.set_margin_end(24)
-        
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        # Setup main UI components
+        self._setup_ui()
+
+        # Create the ColumnView for displaying kernels as a table
+        self._create_column_view()
+
+        # Initialize kernel data loading
+        self._show_loading_ui()
+        GLib.idle_add(self._load_kernels)
+
+    def _setup_ui(self):
+        """Setup the main UI components."""
+        # Scroll container
+        self.scroll = Gtk.ScrolledWindow(
+            vexpand=True,
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+        )
+
+        # Content box with width limit
+        self.content = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_bottom=24,
+            margin_start=12,
+            margin_end=12,
+        )
+
+        # Set maximum width to 800px
+        self.content.set_size_request(800, -1)  # Width: 800px, Height: natural
+        self.content.set_halign(Gtk.Align.CENTER)  # Center the content box
+
+        self.scroll.set_child(self.content)
+        self.append(self.scroll)
+
         # Initialize kernel manager
         self.kernel_manager = KernelManager()
-        
-        # Create content
-        self._create_content()
-        
-        # Load available kernels
-        self._load_kernels()
-    
-    def _create_content(self):
-        """Create the UI elements for kernel management with fixed layout."""
-        # Create main container as scrolled window to maintain fixed window size
-        main_scrolled = Gtk.ScrolledWindow()
-        main_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        main_scrolled.set_min_content_height(580)  # Adjust to match your window height
-        main_scrolled.set_vexpand(True)
-        
-        # Main content box inside scrolled window
-        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        main_box.set_margin_top(24)
-        main_box.set_margin_bottom(24)
-        main_box.set_margin_start(24)
-        main_box.set_margin_end(24)
-        
-        # Create a ClampView to constrain content width for better readability
-        clamp = Adw.Clamp()
-        clamp.set_maximum_size(800)
-        clamp.set_tightening_threshold(600)
-        
-        # Inner content container
-        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        
-        # Add header with Adw.PreferencesGroup for better GNOME style
-        kernel_group = Adw.PreferencesGroup()
-        kernel_group.set_title("Kernel Versions")
-        kernel_group.set_description("Select a kernel version to install or update")
-        
-        # Create scrolled window for kernels that will resize itself
-        self.kernels_scrolled = Gtk.ScrolledWindow()
-        self.kernels_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.kernels_scrolled.set_vexpand(True)
-        # Important: Start with a larger height, will shrink when progress appears
-        self.kernels_scrolled.set_min_content_height(450)
-        
-        # Create listbox for kernels with GNOME styling
-        self.kernel_listbox = Gtk.ListBox()
-        self.kernel_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.kernel_listbox.add_css_class("boxed-list")
-        self.kernel_listbox.add_css_class("card")
-        
-        self.kernels_scrolled.set_child(self.kernel_listbox)
-        kernel_group.add(self.kernels_scrolled)
-        
-        # Add the group to the content box
-        content_box.append(kernel_group)
-        
-        # Progress section (initially hidden)
-        progress_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        progress_card.add_css_class("card")
-        progress_card.set_margin_top(16)
-        progress_card.set_spacing(8)
-        
-        self.progress_label = Gtk.Label.new("Installation Progress")
-        self.progress_label.set_halign(Gtk.Align.START)
-        self.progress_label.set_margin_start(16)
-        self.progress_label.set_margin_top(12)
-        progress_card.append(self.progress_label)
-        
-        self.progress_bar = Gtk.ProgressBar()
-        self.progress_bar.set_show_text(True)
-        self.progress_bar.set_margin_start(16)
-        self.progress_bar.set_margin_end(16)
-        self.progress_bar.set_margin_bottom(16)
-        progress_card.append(self.progress_bar)
-        
-        # Terminal expander
-        terminal_expander = Gtk.Expander()
-        terminal_expander.set_label("Show Terminal Output")
-        terminal_expander.add_css_class("caption")
-        terminal_expander.set_margin_top(8)
-        terminal_expander.set_margin_start(16)
-        terminal_expander.set_margin_end(16)
-        terminal_expander.set_margin_bottom(8)
-        self.terminal_expander = terminal_expander
-        
-        # Create scrolled terminal - doesn't expand the window
-        terminal_scroll = Gtk.ScrolledWindow()
-        terminal_scroll.set_min_content_height(150)
-        terminal_scroll.set_max_content_height(150)
-        terminal_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        terminal_scroll.set_vexpand(False)
-        
-        # Create terminal view
-        self.terminal_view = Gtk.TextView()
-        self.terminal_view.set_editable(False)
-        self.terminal_view.set_cursor_visible(False)
-        self.terminal_view.set_monospace(True)
-        self.terminal_view.add_css_class("terminal")
-        self.terminal_view.add_css_class("monospace")
-        self.terminal_view.add_css_class("card")
-        self.terminal_buffer = self.terminal_view.get_buffer()
-        
-        terminal_scroll.set_child(self.terminal_view)
-        terminal_expander.set_child(terminal_scroll)
-        
-        # Connect signal for terminal expansion
-        terminal_expander.connect("notify::expanded", self._on_terminal_expanded)
-        
-        progress_card.append(terminal_expander)
-        content_box.append(progress_card)
-        
-        # Progress card is initially hidden
-        progress_card.set_visible(False)
-        self.progress_container = progress_card
-        
-        # Set the clamp's child to the content box
-        clamp.set_child(content_box)
-        main_box.append(clamp)
-        
-        # Set the main box as the child of the scrolled window
-        main_scrolled.set_child(main_box)
-        
-        # Add the main scrolled window to this widget
-        self.append(main_scrolled)
-        
-    def _on_terminal_expanded(self, expander, param):
-        """Adjust layout when terminal is expanded/collapsed."""
-        expanded = expander.get_expanded()
-        
-        if expanded:
-            # When terminal is expanded, reduce the kernel list height
-            self.kernels_scrolled.set_min_content_height(250)
-        else:
-            # When terminal is collapsed, restore kernel list height
-            self.kernels_scrolled.set_min_content_height(350)
+        self.loading_page = None
 
-    def _show_progress_container(self):
-        """Show the progress container and adjust layout."""
-        if not self.progress_container.get_visible():
-            self.progress_container.set_visible(True)
-            # Reduce the kernel list size when progress container appears
-            self.kernels_scrolled.set_min_content_height(350)
-            
-    def _hide_progress_container(self):
-        """Hide the progress container and restore layout."""
-        if hasattr(self, 'terminal_expander'):
-            self.terminal_expander.set_expanded(False)
-        
-        # Reset terminal buffer
-        if hasattr(self, 'terminal_buffer') and self.terminal_buffer:
-            self.terminal_buffer.set_text("", 0)
-        
-        # Delay hiding to let animations complete
-        GLib.timeout_add(100, self._actually_hide_progress_container)
-        return False
-    
-    def _actually_hide_progress_container(self):
-        """Actually hide the progress container."""
-        self.progress_container.set_visible(False)
-        # Restore the kernel list to full size
-        self.kernels_scrolled.set_min_content_height(450)
-        return False
-        
-    def _load_kernels(self):
-        """Load available kernels from the kernel manager."""
-        # Clear existing items
-        while True:
-            row = self.kernel_listbox.get_first_child()
-            if row is None:
-                break
-            self.kernel_listbox.remove(row)
-        
-        # Get available kernels
-        kernels = self.kernel_manager.get_available_kernels()
-        
-        # Add kernels to the list
-        for kernel in kernels:
-            row = self._create_kernel_row(kernel)
-            self.kernel_listbox.append(row)
-    
-    def _create_kernel_row(self, kernel):
-        """
-        Create a row for a kernel in the list.
-        
-        Args:
-            kernel: Dictionary with kernel information.
-            
-        Returns:
-            Gtk.ListBoxRow: The created row.
-        """
-        # Create a row with kernel information
-        row = Adw.ActionRow()
-        row.set_title(kernel["name"])
-        row.set_subtitle(f"Version: {kernel['version']}")
-        
-        # Add kernel icon (using a more specific icon based on kernel type)
-        icon_name = "system-run-symbolic"
-        if kernel.get("xanmod", False):
-            icon_name = "application-x-executable-symbolic"
-        elif "lts" in kernel["name"].lower() or kernel.get("lts", False):
-            icon_name = "emblem-default-symbolic"
-            
-        icon = Gtk.Image.new_from_icon_name(icon_name)
-        row.add_prefix(icon)
-        
-        # Container for kernel tags on the left
-        tag_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        tag_box.set_margin_end(12)
-        
-        # Add tag for RT kernels if applicable
-        if "rt" in kernel.get("name", "") or kernel.get("rt", False):
-            rt_tag = Gtk.Label.new("RT")
-            rt_tag.add_css_class("accent")
-            rt_tag.add_css_class("tag")
-            rt_tag.add_css_class("caption")
-            rt_tag.set_margin_start(4)
-            rt_tag.set_margin_end(4)
-            rt_box = Gtk.Box()
-            rt_box.add_css_class("card")
-            rt_box.add_css_class("accent")
-            rt_box.set_margin_end(4)
-            rt_box.append(rt_tag)
-            tag_box.append(rt_box)
-        
-        # Add tag for LTS kernels
-        if "-lts" in kernel.get("name", "") or kernel.get("lts", False):
-            lts_tag = Gtk.Label.new("LTS")
-            lts_tag.add_css_class("success")
-            lts_tag.add_css_class("tag")
-            lts_tag.add_css_class("caption")
-            lts_tag.set_margin_start(4)
-            lts_tag.set_margin_end(4)
-            lts_box = Gtk.Box()
-            lts_box.add_css_class("card")
-            lts_box.add_css_class("success")
-            lts_box.set_margin_end(4)
-            lts_box.append(lts_tag)
-            tag_box.append(lts_box)
-        
-        # Add tag for optimized builds
-        if kernel.get("optimized", False):
-            opt_tag = Gtk.Label.new(f"x64v{kernel.get('opt_level', '')}")
-            opt_tag.add_css_class("accent")
-            opt_tag.add_css_class("tag")
-            opt_tag.add_css_class("caption")
-            opt_tag.set_margin_start(4)
-            opt_tag.set_margin_end(4)
-            opt_box = Gtk.Box()
-            opt_box.add_css_class("card")
-            opt_box.add_css_class("accent")
-            opt_box.set_margin_end(4)
-            opt_box.append(opt_tag)
-            tag_box.append(opt_box)
-            
-        # Add tags to the row if any were created
-        if tag_box.get_first_child() is not None:
-            row.add_suffix(tag_box)
-        
-        # Add buttons in a button box for better alignment
-        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        button_box.set_margin_top(8)
-        button_box.set_margin_bottom(8)
-        
-        if kernel.get("installed", False):
-            # If kernel is already installed, show the "Installed" tag and offer removal
-            installed_tag = Gtk.Label.new("Installed")
-            installed_tag.add_css_class("success")
-            installed_tag.add_css_class("caption")
-            installed_tag.set_margin_start(4)
-            installed_tag.set_margin_end(4)
-            
-            installed_box = Gtk.Box()
-            installed_box.add_css_class("card")
-            installed_box.add_css_class("success")
-            installed_box.set_margin_start(4)
-            installed_box.set_margin_end(8)
-            installed_box.append(installed_tag)
-            button_box.append(installed_box)
-            
-            # Only offer removal if it's not the currently running kernel
-            remove_button = Gtk.Button.new_with_label("Remove")
-            remove_button.add_css_class("destructive-action")
-            remove_button.connect("clicked", self._on_remove_clicked, kernel)
-            button_box.append(remove_button)
-        else:
-            # Add install button for non-installed kernels
-            install_button = Gtk.Button.new_with_label("Install")
-            install_button.add_css_class("suggested-action")
-            install_button.connect("clicked", self._on_install_clicked, kernel)
-            button_box.append(install_button)
-        
-        row.add_suffix(button_box)
-        
-        # Add some extra whitespace for better readability
-        row.set_margin_top(2)
-        row.set_margin_bottom(2)
-            
-        return row
-    
-    def _on_refresh_clicked(self, button):
-        """Callback for refresh button click."""
-        self._load_kernels()
-    
-    def _on_install_clicked(self, button, kernel):
-        """Callback for install button click."""
-        # Show confirmation dialog
-        dialog = Adw.MessageDialog.new(self.get_root())
-        dialog.set_heading("Install Kernel")
-        dialog.set_body(f"Are you sure you want to install the {kernel['name']} kernel?\n\nThis will install the kernel and its modules.\nThis operation requires sudo privileges.")
-        
-        dialog.add_response("cancel", "Cancel")
-        dialog.add_response("install", "Install")
-        dialog.set_response_appearance("install", Adw.ResponseAppearance.SUGGESTED)
-        dialog.set_default_response("cancel")
-        dialog.set_close_response("cancel")
-        
-        # Connect response signal
-        dialog.connect("response", self._on_install_dialog_response, kernel, button)
-        
-        dialog.present()
-
-    def _on_install_dialog_response(self, dialog, response, kernel, button):
-        """Handle install dialog response."""
-        if response != "install":
-            return
-        
-        # Show progress immediately
-        self._show_progress_container()
-        self.progress_label.set_text(f"Installing {kernel['name']} Kernel")
-        self.progress_bar.set_fraction(0.0)
-        self.progress_bar.set_text(f"Preparing to install {kernel['name']}...")
-        
-        # Clear terminal buffer
-        if hasattr(self, 'terminal_buffer') and self.terminal_buffer:
-            self.terminal_buffer.set_text("", 0)
-        
-        # Disable button
-        button.set_sensitive(False)
-        
-        # Add initial terminal output
-        self._direct_terminal_output(f"Starting installation of {kernel['name']} kernel...\n")
-        self._direct_terminal_output(f"This may take a few minutes. Please wait...\n")
-        
-        # Start installation
-        self.kernel_manager.install_kernel(
-            kernel,
-            progress_callback=self._update_progress,
-            output_callback=self._output_to_terminal,
-            complete_callback=lambda success: GLib.idle_add(
-                self._installation_complete, button, success
-            )
+    def _create_column_view(self):
+        """Create the column view for displaying kernels."""
+        # Create the container box
+        self.kernel_list_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=0,
+            margin_top=8,
         )
-    
-    def _on_remove_clicked(self, button, kernel):
-        """
-        Callback for remove button click.
-        
-        Args:
-            button: The button that was clicked.
-            kernel: The kernel to remove.
-        """
-        # Show confirmation dialog before removing - compatible with older libadwaita
-        dialog = Adw.MessageDialog.new(self.get_root())
-        dialog.set_heading("Remove Kernel")
-        dialog.set_body(f"Are you sure you want to remove the {kernel['name']} kernel?\n\nThis will remove the kernel and its modules.\nThis operation requires sudo privileges.")
-        
-        dialog.add_response("cancel", "Cancel")
-        dialog.add_response("remove", "Remove")
-        dialog.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
-        dialog.set_default_response("cancel")
-        dialog.set_close_response("cancel")
-        
-        # Connect the response signal
-        dialog.connect("response", self._on_remove_dialog_response, kernel, button)
-        
-        # Show the dialog
-        dialog.present()
 
-    def _on_remove_dialog_response(self, dialog, response, kernel, button):
-        """Handle the remove confirmation dialog response."""
-        if response != "remove":
-            return
-        
-        # Imediatamente mostrar progresso
-        self.progress_container.set_visible(True)
-        self.progress_label.set_text(f"Removing {kernel['name']} Kernel")
-        self.progress_bar.set_fraction(0.0)
-        self.progress_bar.set_text(f"Preparing to remove {kernel['name']}...")
-        
-        # Limpar o buffer de terminal antes de iniciar
-        if hasattr(self, 'terminal_buffer') and self.terminal_buffer:
-            self.terminal_buffer.set_text("", 0)
-        
-        # Disable button during removal
-        button.set_sensitive(False)
-        
-        # Adicionar mensagem ao terminal diretamente para feedback ao usuário
-        self._direct_terminal_output(f"Starting removal of {kernel['name']} kernel...\n")
-        self._direct_terminal_output(f"This may take a few minutes. Please wait...\n")
-        
-        # Start removal in a separate thread to avoid UI freezing
-        self.kernel_manager.remove_kernel(
-            kernel,
-            progress_callback=self._update_progress,
-            output_callback=self._output_to_terminal,
-            complete_callback=lambda success: GLib.idle_add(
-                self._removal_complete, button, success
-            )
+        # Set up store and models
+        self.store = Gio.ListStore(item_type=KernelModel)
+
+        # Create sorter and connect it properly to enable column header sorting
+        self.sorter = Gtk.MultiSorter.new()
+        self.sort_model = Gtk.SortListModel.new(self.store, self.sorter)
+        self.selection = Gtk.SingleSelection.new(self.sort_model)
+
+        # Create the column view with the proper sort mechanism
+        self.column_view = Gtk.ColumnView.new(self.selection)
+        self.column_view.add_css_class("card")
+        self.column_view.set_show_row_separators(True)
+        self.column_view.set_show_column_separators(True)
+
+        # Important: Connect the sorter to the column view so clicks work
+        self.column_view.set_model(self.selection)
+        self.column_view.set_halign(Gtk.Align.CENTER)
+
+        # Add the columns with a simplified approach
+        self._add_columns()
+
+        # Add to scrolled window
+        scrolled_window = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        scrolled_window.set_child(self.column_view)
+        self.kernel_list_box.append(scrolled_window)
+
+        # Add to main content
+        self.content.append(self.kernel_list_box)
+
+    def _add_columns(self):
+        """Add columns to the column view with appropriate sorters."""
+        # Create expression objects for properties
+        name_expr = Gtk.PropertyExpression.new(KernelModel.__gtype__, None, "name")
+        version_expr = Gtk.PropertyExpression.new(
+            KernelModel.__gtype__, None, "version"
         )
-    
-    def _update_progress(self, fraction, text=None):
-        """
-        Update the progress bar.
-        
-        Args:
-            fraction: Progress fraction (0.0 to 1.0).
-            text: Optional text to display.
-        """
-        # Utilize GLib.idle_add para garantir que as atualizações ocorram no thread principal
-        GLib.idle_add(self._update_progress_idle, fraction, text)
+        lts_expr = Gtk.PropertyExpression.new(KernelModel.__gtype__, None, "is_lts")
+        rt_expr = Gtk.PropertyExpression.new(KernelModel.__gtype__, None, "is_rt")
+        installed_expr = Gtk.PropertyExpression.new(
+            KernelModel.__gtype__, None, "installed"
+        )
+        running_expr = Gtk.PropertyExpression.new(
+            KernelModel.__gtype__, None, "running"
+        )
 
-    def _update_progress_idle(self, fraction, text):
-        """Update progress bar from main thread."""
-        # Limitar a fração entre 0 e 1
-        fraction = max(0.0, min(1.0, fraction))
-        
-        # Atualizar a barra de progresso
-        self.progress_bar.set_fraction(fraction)
-        
-        # Atualizar o texto, incluindo a porcentagem
-        if text:
-            # Adicionar porcentagem ao texto se não estiver presente
-            if "%" not in text:
-                percentage = fraction * 100
-                display_text = f"{text} ({percentage:.1f}%)"
+        # Add Name column
+        self._add_text_column("Package Name", True, name_expr, self._bind_name_cell)
+
+        # Add Version column
+        self._add_text_column("Version", False, version_expr, self._bind_version_cell)
+
+        # Add Type column
+        type_factory = Gtk.SignalListItemFactory.new()
+        type_factory.connect("setup", self._setup_type_cell)
+        type_factory.connect("bind", self._bind_type_cell)
+
+        type_sorter = Gtk.MultiSorter.new()
+        type_sorter.append(Gtk.NumericSorter.new(lts_expr))
+        type_sorter.append(Gtk.NumericSorter.new(rt_expr))
+
+        type_column = Gtk.ColumnViewColumn.new("Type", type_factory)
+        type_column.set_resizable(True)
+        type_column.set_sorter(type_sorter)
+        self.column_view.append_column(type_column)
+
+        # Add Action column (not sortable)
+        action_factory = Gtk.SignalListItemFactory.new()
+        action_factory.connect("setup", self._setup_action_cell)
+        action_factory.connect("bind", self._bind_action_cell)
+        action_column = Gtk.ColumnViewColumn.new("Action", action_factory)
+        action_column.set_resizable(True)
+        self.column_view.append_column(action_column)
+
+    def _add_text_column(self, title, expand, expr, bind_func):
+        """Helper to add a text column with sorting."""
+        factory = Gtk.SignalListItemFactory.new()
+        factory.connect("setup", self._setup_text_cell)
+        factory.connect("bind", bind_func)
+
+        column = Gtk.ColumnViewColumn.new(title, factory)
+        column.set_resizable(True)
+        if expand:
+            column.set_expand(True)
+
+        # Create sorter based on property name (simplify the type check)
+        if isinstance(expr, Gtk.PropertyExpression):
+            # Just assume string sorter is appropriate for most cases
+            # This avoids the need for get_expression_type()
+            if title.lower() == "status":
+                # Special case for status column
+                sorter = Gtk.NumericSorter.new(expr)
             else:
-                display_text = text
-            
-            self.progress_bar.set_text(display_text)
-            self.progress_label.set_text(display_text)
-        else:
-            # Apenas exibir a porcentagem se nenhum texto for fornecido
-            percentage = fraction * 100
-            display_text = f"Progress: {percentage:.1f}%"
-            self.progress_bar.set_text(display_text)
-        
-        # Garantir que a barra de progresso esteja visível
-        if not self.progress_container.get_visible():
-            self.progress_container.set_visible(True)
-            
-        return False  # Não chamar novamente
-    
-    def _direct_terminal_output(self, text):
-        """
-        Add text directly to the terminal buffer without using threads or idle_add.
-        This method should only be called from the main thread.
-        """
-        if not hasattr(self, 'terminal_buffer') or not self.terminal_buffer:
-            return
-            
-        end_iter = self.terminal_buffer.get_end_iter()
-        self.terminal_buffer.insert(end_iter, text)
-        
-        # Rolar para o final
-        vadj = self.terminal_view.get_vadjustment()
-        if vadj:
-            vadj.set_value(vadj.get_upper() - vadj.get_page_size())
-    
-    def _output_to_terminal(self, text):
-        """
-        Add text to the terminal view.
-        
-        Args:
-            text: Text to add to the terminal.
-        """
-        if not text:
-            return
-            
-        # Add newline if needed
-        if not text.endswith('\n'):
-            text += '\n'
-        
-        # Use GLib.idle_add para garantir que a manipulação do buffer ocorra no thread principal
-        GLib.idle_add(self._output_to_terminal_idle, text)
+                sorter = Gtk.StringSorter.new(expr)
 
-    def _output_to_terminal_idle(self, text):
-        """
-        Add text to the terminal view from the main thread.
-        
-        Args:
-            text: Text to add to the terminal.
-        """
+            column.set_sorter(sorter)
+
+        # Connect to sorter changed event
+        column.connect("notify::sorter-order", self._on_sort_changed)
+
+        self.column_view.append_column(column)
+        return column
+
+    def _on_sort_changed(self, column, pspec):
+        """Handle column header click for sorting."""
+        # Get all columns
+        columns = self.column_view.get_columns()
+
+        # Find which column was clicked
+        for i, col in enumerate(columns):
+            if col == column:
+                # Get sort order
+                order = column.get_sorter_order()
+
+                # Clear existing sorters
+                self.sorter.remove_all()
+
+                # Add new sorter if actively sorting
+                if order != Gtk.SorterOrder.NONE:
+                    sorter = column.get_sorter()
+                    if sorter:
+                        self.sorter.append(sorter)
+
+                # Log for debugging
+                print(f"Column {i} ({column.get_title()}) clicked, order: {order}")
+                break
+
+    def _setup_text_cell(self, factory, list_item):
+        """Setup a basic text cell."""
+        label = Gtk.Label(xalign=0, margin_start=12, margin_end=12)
+        list_item.set_child(label)
+
+    def _bind_name_cell(self, factory, list_item):
+        """Bind the kernel name cell."""
+        kernel = list_item.get_item()
+        label = list_item.get_child()
+        label.set_text(kernel.get_property("name"))
+        if kernel.get_property("running"):
+            label.add_css_class("bold")
+        else:
+            label.remove_css_class("bold")
+
+    def _bind_version_cell(self, factory, list_item):
+        """Bind the version cell."""
+        kernel = list_item.get_item()
+        label = list_item.get_child()
+        label.set_text(kernel.get_property("version"))
+
+    def _setup_type_cell(self, factory, list_item):
+        """Setup the type cell for LTS/RT badges."""
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=4,
+            margin_start=12,
+            margin_end=12,
+        )
+        list_item.set_child(box)
+
+    def _bind_type_cell(self, factory, list_item):
+        """Bind the type cell with LTS/RT badges."""
+        kernel = list_item.get_item()
+        box = list_item.get_child()
+
+        # Clear previous children
+        while box.get_first_child():
+            box.remove(box.get_first_child())
+
+        if kernel.get_property("is_lts"):
+            box.append(self._create_badge("LTS", "success"))
+
+        if kernel.get_property("is_rt"):
+            box.append(self._create_badge("RT", "accent"))
+
+    def _setup_action_cell(self, factory, list_item):
+        """Setup the action button cell."""
+        button = Gtk.Button(margin_start=12, margin_end=12)
+        button.set_size_request(90, 30)
+
+        # Make button more compact
+        button_content = button.get_first_child()
+        if button_content:
+            button_content.set_margin_top(2)
+            button_content.set_margin_bottom(2)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        box.append(button)
+        list_item.set_child(box)
+
+    def _bind_action_cell(self, factory, list_item):
+        """Bind the action button cell."""
+        kernel = list_item.get_item()
+        box = list_item.get_child()
+        button = box.get_first_child()
+        button.kernel = kernel
+
+        # Disconnect any existing signals
+        for handler_id in getattr(button, "handler_ids", []):
+            if button.handler_is_connected(handler_id):
+                button.disconnect(handler_id)
+        button.handler_ids = []
+
+        # Setup button based on kernel status
+        if kernel.get_property("running"):
+            self._setup_running_button(button)
+        elif kernel.get_property("installed"):
+            self._setup_installed_button(button)
+        else:
+            self._setup_not_installed_button(button)
+
+    def _setup_running_button(self, button):
+        """Setup button for running kernel."""
+        button.set_label("In Use")
+        button.set_sensitive(False)
+        button.add_css_class("warning")
+        button.remove_css_class("destructive-action")
+        button.remove_css_class("suggested-action")
+
+    def _setup_installed_button(self, button):
+        """Setup button for installed (but not running) kernel."""
+        button.set_label("Remove")
+        button.set_sensitive(True)
+        button.add_css_class("destructive-action")
+        button.remove_css_class("warning")
+        button.remove_css_class("suggested-action")
+
+        # Connect remove handler
+        handler_id = button.connect("clicked", self._on_remove_clicked)
+        button.handler_ids = [handler_id]
+
+    def _setup_not_installed_button(self, button):
+        """Setup button for not installed kernel."""
+        button.set_label("Install")
+        button.set_sensitive(True)
+        button.add_css_class("suggested-action")
+        button.remove_css_class("destructive-action")
+        button.remove_css_class("warning")
+
+        # Connect install handler
+        handler_id = button.connect("clicked", self._on_install_clicked)
+        button.handler_ids = [handler_id]
+
+    def _show_loading_ui(self):
+        """Show loading UI and hide kernel list."""
+        # Remove existing loading page
+        if self.loading_page:
+            self.content.remove(self.loading_page)
+            self.loading_page = None
+
+        # Create new loading page
+        self.loading_page = Adw.StatusPage(
+            icon_name="emblem-synchronizing-symbolic",
+            title="Loading Kernels",
+            description="Please wait while we retrieve kernel information",
+        )
+
+        spinner = Gtk.Spinner()
+        spinner.set_size_request(24, 24)
+        spinner.start()
+        self.loading_page.set_child(spinner)
+
+        # Add to content and hide kernel list
+        self.content.prepend(self.loading_page)
+        self.kernel_list_box.set_visible(False)
+
+    def _hide_loading_ui(self):
+        """Hide the loading UI."""
+        if self.loading_page:
+            self.content.remove(self.loading_page)
+            self.loading_page = None
+        self.kernel_list_box.set_visible(True)
+
+    def _load_kernels(self):
+        """Load kernel information."""
+        threading.Thread(target=self._background_load_kernels, daemon=True).start()
+        return False
+
+    def _background_load_kernels(self):
+        """Load kernels in background thread."""
         try:
-            if not hasattr(self, 'terminal_buffer') or not self.terminal_buffer:
-                print(f"Terminal output (no buffer): {text.strip()}")
-                return False
-                
-            # Obter o buffer do TextView
-            buffer = self.terminal_buffer
-            
-            # No GTK 4, devemos sempre obter um novo iterador do final
-            end_iter = buffer.get_end_iter()
-            
-            # Inserir texto no final
-            buffer.insert(end_iter, text)
-            
-            # Rolar para o final - método seguro para GTK 4
-            # Primeiro obter o ajuste vertical
-            vadj = self.terminal_view.get_vadjustment()
-            if vadj:
-                # Rolar para a posição máxima
-                vadj.set_value(vadj.get_upper() - vadj.get_page_size())
-            
-            # Log também no console por segurança
-            print(f"Terminal output: {text.strip()}")
+            kernels = self.kernel_manager.get_available_kernels()
+            GLib.idle_add(self._display_kernels, kernels)
         except Exception as e:
-            print(f"Error updating terminal: {e}")
-        
-        return False  # Não chamar novamente
-    
-    def _installation_complete(self, button, success):
-        """Handle installation completion."""
-        # Re-enable button
-        button.set_sensitive(True)
-        
-        # Update progress
-        if success:
-            self.progress_bar.set_fraction(1.0)
-            self.progress_bar.set_text("Installation complete!")
-            
-            # Show completion dialog
-            self._show_completion_dialog(
-                "Installation Complete", 
-                f"The kernel was installed successfully.\nYou may need to reboot to use the new kernel.",
-                "success"
-            )
-        else:
-            self.progress_bar.set_text("Installation failed.")
-            
-            # Show failure dialog
-            self._show_completion_dialog(
-                "Installation Failed", 
-                "The kernel installation failed. Please check the terminal output for details.",
-                "error"
-            )
-        
-        # Refresh kernel list
-        self._load_kernels()
-        
+            GLib.idle_add(self._show_error, str(e))
+
+    def _display_kernels(self, kernels):
+        """Display the kernel list in the UI."""
+        # Hide loading UI and clear current model
+        self._hide_loading_ui()
+        self.store.remove_all()
+
+        if not kernels:
+            self._show_empty_state()
+            return False
+
+        # Add kernels directly to store - no need for sorting as it will be handled by GTK
+        for kernel in kernels:
+            self.store.append(KernelModel(kernel))
+
         return False
 
-    def _removal_complete(self, button, success):
-        """Handle removal completion."""
-        # Re-enable button
-        button.set_sensitive(True)
-        
-        # Update progress
-        if success:
-            self.progress_bar.set_fraction(1.0)
-            self.progress_bar.set_text("Removal complete!")
-            
-            # Show completion dialog
-            self._show_completion_dialog(
-                "Removal Complete", 
-                "The kernel was removed successfully.",
-                "success"
+    def _show_empty_state(self):
+        """Show message when no kernels are available."""
+        # Hide kernel list
+        self.kernel_list_box.set_visible(False)
+
+        # Create empty state if it doesn't exist
+        if not hasattr(self, "empty_state"):
+            self.empty_state = Adw.StatusPage(
+                icon_name="dialog-warning-symbolic",
+                title="No Kernel Versions Available",
+                description="Check your internet connection and try again",
             )
+
+            button = Gtk.Button(label="Retry", css_classes=["pill", "suggested-action"])
+            button.connect("clicked", lambda _: self._refresh_kernels())
+            self.empty_state.set_child(button)
+
+        # Add to content
+        if self.empty_state not in self.content:
+            self.content.append(self.empty_state)
+
+    def _show_error(self, error_message):
+        """Show error message when kernel loading fails."""
+        # Hide loading UI and kernel list
+        self._hide_loading_ui()
+        self.kernel_list_box.set_visible(False)
+
+        # Create or update error state
+        if not hasattr(self, "error_state"):
+            self.error_state = Adw.StatusPage(
+                icon_name="dialog-error-symbolic",
+                title="Error Loading Kernels",
+                description=error_message,
+            )
+
+            button = Gtk.Button(label="Retry", css_classes=["pill", "suggested-action"])
+            button.connect("clicked", lambda _: self._refresh_kernels())
+            self.error_state.set_child(button)
         else:
-            self.progress_bar.set_text("Removal failed.")
-            
-            # Show failure dialog
-            self._show_completion_dialog(
-                "Removal Failed", 
-                "The kernel removal failed. Please check the terminal output for details.",
-                "error"
-            )
-        
-        # Refresh kernel list
-        self._load_kernels()
-        
+            self.error_state.set_description(error_message)
+
+        # Add to content
+        if self.error_state not in self.content:
+            self.content.append(self.error_state)
+
         return False
 
-    def _show_completion_dialog(self, title, message, status):
-        """Show a completion dialog with OK button."""
+    def _refresh_kernels(self):
+        """Refresh kernel list."""
+        # Hide any status pages
+        if hasattr(self, "empty_state") and self.empty_state in self.content:
+            self.content.remove(self.empty_state)
+
+        if hasattr(self, "error_state") and self.error_state in self.content:
+            self.content.remove(self.error_state)
+
+        self._show_loading_ui()
+        GLib.timeout_add(100, self._load_kernels)
+
+    def _create_badge(self, text, style_class):
+        """Create a styled badge widget."""
+        badge = Gtk.Label(label=text)
+        badge.add_css_class("caption")
+        badge.add_css_class("tag")
+        badge.add_css_class(style_class)
+        return badge
+
+    def _on_install_clicked(self, button):
+        """Handle install button click."""
+        kernel = button.kernel
+        self._show_confirmation_dialog(
+            title="Install Kernel",
+            message=(
+                f"Are you sure you want to install the {kernel.get_property('name')} kernel?\n\n"
+                "This will install the kernel and its modules.\n"
+                "This operation requires sudo privileges."
+            ),
+            action="install",
+            kernel=kernel.original_data,
+            button=button,
+        )
+
+    def _on_remove_clicked(self, button):
+        """Handle remove button click."""
+        kernel = button.kernel
+        self._show_confirmation_dialog(
+            title="Remove Kernel",
+            message=(
+                f"Are you sure you want to remove the {kernel.get_property('name')} kernel?\n\n"
+                "This will remove the kernel and its modules.\n"
+                "This operation requires sudo privileges."
+            ),
+            action="remove",
+            kernel=kernel.original_data,
+            button=button,
+            destructive=True,
+        )
+
+    def _show_confirmation_dialog(
+        self, title, message, action, kernel, button, destructive=False
+    ):
+        """Show confirmation dialog for kernel operations."""
         dialog = Adw.MessageDialog.new(self.get_root())
         dialog.set_heading(title)
         dialog.set_body(message)
-        
-        # Add icon based on status
-        if hasattr(dialog, 'set_icon_name'):  # Check if method exists
-            if status == "success":
-                dialog.set_icon_name("emblem-ok-symbolic")
-            else:
-                dialog.set_icon_name("dialog-error-symbolic")
-        
-        dialog.add_response("ok", "OK")
-        dialog.set_default_response("ok")
-        dialog.set_close_response("ok")
-        
-        # Connect close response to hide progress container
-        dialog.connect("response", lambda d, r: self._hide_progress_container())
-        
-        dialog.present()
-    
-    def _hide_progress_bar(self):
-        """Hide the progress bar."""
-        # Ensure the terminal is contracted before hiding
-        if hasattr(self, 'terminal_expander'):
-            self.terminal_expander.set_expanded(False)
-        
-        # Reset terminal buffer to avoid unnecessary scrollbars
-        if hasattr(self, 'terminal_buffer') and self.terminal_buffer:
-            self.terminal_buffer.set_text("", 0)
-        
-        # Small delay before hiding to ensure animations are complete
-        GLib.timeout_add(100, self._actually_hide_progress_bar)
-        return False  # Don't call again
 
-    def _actually_hide_progress_bar(self):
-        """Actually hide the progress container after a short delay."""
-        self.progress_container.set_visible(False)
-        return False  # Don't call again
-    
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response(action, "Yes, " + action.title())
+
+        dialog.set_response_appearance(
+            action,
+            Adw.ResponseAppearance.DESTRUCTIVE
+            if destructive
+            else Adw.ResponseAppearance.SUGGESTED,
+        )
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        # Connect response handler
+        dialog.connect(
+            "response",
+            lambda d, r: self._on_dialog_response(d, r, action, kernel, button),
+        )
+
+        dialog.present()
+
+    def _on_dialog_response(self, dialog, response, action, kernel, button):
+        """Handle dialog response for both install and remove actions."""
+        if response != action:
+            return
+
+        # Setup progress dialog
+        progress_dialog = ProgressDialog(
+            parent_window=self.get_root(),
+            title=f"{action.title()}ing {kernel['name']} Kernel",
+            operation_type=action,
+            target_name=kernel["name"],
+            cancel_callback=lambda: self._on_operation_canceled(kernel),
+        )
+
+        # Store reference and show dialog
+        self.progress_dialog = progress_dialog
+        progress_dialog.show()
+
+        # Disable button and show initial message
+        button.set_sensitive(False)
+        progress_dialog.append_terminal_text(
+            f"Starting {action} of {kernel['name']} kernel...\n"
+            f"This may take a few minutes. Please wait...\n"
+        )
+
+        # Start operation in background
+        operation_method = (
+            self.kernel_manager.install_kernel
+            if action == "install"
+            else self.kernel_manager.remove_kernel
+        )
+
+        operation_method(
+            kernel,
+            progress_callback=progress_dialog.update_progress,
+            output_callback=progress_dialog.append_terminal_text,
+            complete_callback=lambda success: GLib.idle_add(
+                self._operation_complete, button, kernel, action, success
+            ),
+        )
+
+    def _on_operation_canceled(self, kernel):
+        """Handle cancel button click during operation."""
+        if hasattr(self, "progress_dialog"):
+            delattr(self, "progress_dialog")
+        self._load_kernels()
+
+    def _operation_complete(self, button, kernel, operation, success):
+        """Handle operation completion."""
+        # Re-enable button
+        button.set_sensitive(True)
+
+        # Update progress dialog
+        if hasattr(self, "progress_dialog") and self.progress_dialog:
+            self.progress_dialog.set_complete(success)
+
+        # Show toast notification
+        operation_name = "installation" if operation == "install" else "removal"
+        message = f"Kernel {operation_name} {'successful' if success else 'failed'}"
+        self._show_toast(message, "error" if not success else "success")
+
+        # Refresh kernel list
+        self._refresh_kernels()
+        return False
+
+    def _show_toast(self, message, style="success"):
+        """Show a toast notification."""
+        window = self.get_root()
+        if window and hasattr(window, "add_toast"):
+            window.add_toast(message)
+            return
+
+        # Fallback to looking for toast overlay
+        overlay = self._find_toast_overlay()
+        if overlay:
+            toast = Adw.Toast.new(message)
+            toast.set_timeout(3)
+            if style == "error":
+                toast.set_priority(Adw.ToastPriority.HIGH)
+            overlay.add_toast(toast)
+
     def _find_toast_overlay(self):
         """Find the nearest ToastOverlay in the widget hierarchy."""
-        # Try to find a toast overlay in the hierarchy
         widget = self
         while widget:
             if isinstance(widget, Adw.ToastOverlay):
                 return widget
+
             parent = widget.get_parent()
             if parent is None:
-                # Try to get the root widget
+                # Try to get the root
                 root = widget.get_root()
                 if root and hasattr(root, "get_content"):
                     content = root.get_content()
-                    # Check if content is a toast overlay or contains one
                     if isinstance(content, Adw.ToastOverlay):
                         return content
-                    # Try to find a toast overlay in the content
-                    if hasattr(content, "get_first_child"):
-                        child = content.get_first_child()
-                        while child:
-                            if isinstance(child, Adw.ToastOverlay):
-                                return child
-                            child = child.get_next_sibling()
                 break
+
             widget = parent
-        
-        # Fall back to checking if we have a window with a toast overlay
-        window = self.get_root()
-        if window:
-            content = window.get_content()
-            while content:
-                if isinstance(content, Adw.ToastOverlay):
-                    return content
-                if hasattr(content, "get_content"):
-                    content = content.get_content()
-                else:
-                    break
-        
-        # No toast overlay found
+
         return None
